@@ -17,7 +17,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response, Streamin
 from canonical import canonical_line, norm_ts
 from lsnutil import lsn_to_int
 from replicator import Replicator
-from store import Store
+from store import MirrorNotReady, Store, VersionNameTaken
+from versions import FIELD_LABELS, diff_catalogs
 
 PG = dict(
     host=os.environ.get("PGHOST", "db"),
@@ -127,6 +128,7 @@ def collect_status():
         "target_lsn": meta.get("target_lsn") or "",
         "ready_at": meta.get("ready_at") or "",
         "mirror_rows": store.read("SELECT count(*) FROM events")[0][0],
+        "version_count": store.read("SELECT count(*) FROM versions WHERE status='ready'")[0][0],
         "crash_armed": replicator.crash_armed.is_set(),
         "source_ok": False,
         "source_rows": None,
@@ -180,6 +182,7 @@ def dashboard():
         ("是否供数", "是" if st["serving"] else "否（未就绪不供数）"),
         ("初始装载行数", st["loaded_rows"]),
         ("镜像当前行数", st["mirror_rows"]),
+        ("已留存目录版本", f"{st['version_count']} 个 · <a href='/versions'>目录版本对照</a>"),
         ("源库当前行数（实时）", st["source_rows"] if st["source_ok"] else "源库不可用"),
         ("已应用源事务数", st["applied_txns"]),
         ("已应用行变更数", st["applied_changes"]),
@@ -243,8 +246,17 @@ def dashboard():
         actions.append("<a class='btn' href='/events'>查询震例</a>")
         actions.append("<a class='btn' href='/events.csv'>下载当前目录 CSV</a>")
         actions.append("<a class='btn' href='/verify'>一致性校验</a>")
+        actions.append(
+            "<form class='inline' method='post' action='/versions/save'>"
+            "<input name='name' required maxlength='60' size='16' "
+            "placeholder='版本名，如 第43周交付'>"
+            "<button type='submit'>留存当前目录为版本</button></form>"
+        )
+        actions.append("<a class='btn' href='/versions'>目录版本对照</a>")
     else:
-        actions.append("<span class='muted'>镜像就绪后开放查询、CSV 下载与一致性校验</span>")
+        actions.append(
+            "<span class='muted'>镜像就绪后开放查询、CSV 下载、一致性校验与目录版本留存</span>"
+        )
 
     log_rows = "".join(
         f"<tr><td>{esc(ts)}</td><td>{esc(msg)}</td></tr>" for ts, msg in st["log"]
@@ -433,6 +445,229 @@ def events_csv(request: Request):
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=quake_catalog.csv"},
     )
+
+
+# ---------------- 路由：目录版本对照 ----------------
+
+DIFF_SHOW_LIMIT = 200   # 每类差异最多展示的条数（计数始终是全量）
+
+
+def fmt_field(field, v):
+    if field == "origin_time":
+        return str(v)
+    if field in ("latitude", "longitude"):
+        return f"{float(v):.3f}"
+    return f"{float(v):.1f}"
+
+
+@app.post("/versions/save")
+async def version_save(request: Request):
+    """留存当前目录为命名版本。就绪状态在留存事务里再校验一次（与行数据同一已提交状态）。"""
+    form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
+    name = (form.get("name") or [""])[0].strip()
+
+    def back(msg=None, err=None):
+        q = urllib.parse.urlencode({k: v for k, v in (("msg", msg), ("err", err)) if v})
+        return RedirectResponse("/versions" + ("?" + q if q else ""), status_code=303)
+
+    if not name:
+        return back(err="版本名不能为空")
+    if len(name) > 60:
+        return back(err="版本名过长（不超过 60 个字符）")
+    try:
+        _vid, n, lsn = store.save_version(name)
+    except VersionNameTaken:
+        return back(err=f"版本名「{name}」已存在，请换一个")
+    except MirrorNotReady as exc:
+        return back(
+            err=f"镜像未就绪（当前状态：{STATE_LABELS.get(exc.state, exc.state)}），"
+                "不能留存目录版本"
+        )
+    return back(msg=f"已留存版本「{name}」：{n} 行，续采位置 {lsn or '—'}")
+
+
+@app.post("/versions/{version_id}/delete")
+def version_delete(version_id: int):
+    store.delete_version(version_id)
+    return RedirectResponse("/versions", status_code=303)
+
+
+@app.get("/versions", response_class=HTMLResponse)
+def versions_page(request: Request):
+    msg = request.query_params.get("msg", "")
+    err = request.query_params.get("err", "")
+    vs = store.list_versions()
+
+    banner = ""
+    if msg:
+        banner += f"<div class='ok'>✔ {esc(msg)}</div>"
+    if err:
+        banner += f"<div class='err'>✘ {esc(err)}</div>"
+
+    if serving():
+        save_form = (
+            "<form method='post' action='/versions/save'>"
+            "<label>版本名</label><input name='name' required maxlength='60' size='20' "
+            "placeholder='如 第43周交付'>"
+            "<button type='submit'>留存当前目录为版本</button>"
+            "<span class='muted'> 震例行、续采位置与就绪状态取自同一已提交镜像；"
+            "续采或重建恰逢留存时不会存下混杂或未就绪的目录</span></form>"
+        )
+    else:
+        save_form = (
+            "<span class='muted'>镜像未就绪，不能留存目录版本（就绪后才可命名留存）。</span>"
+        )
+
+    if vs:
+        body_rows = "".join(
+            f"<tr><td><input type='radio' name='a' value='{vid}' required></td>"
+            f"<td><input type='radio' name='b' value='{vid}' required></td>"
+            f"<td>{esc(name)}</td><td class='mono'>{esc(created_at)}</td>"
+            f"<td>{n}</td><td class='mono'>{esc(lsn or '—')}</td>"
+            f"<td><button type='submit' class='danger' formmethod='post' formnovalidate "
+            f"formaction='/versions/{vid}/delete' "
+            f"onclick='return confirm(\"确定删除该版本？\")'>删除</button></td></tr>"
+            for vid, name, created_at, lsn, n in vs
+        )
+        table = (
+            "<form method='get' action='/versions/diff'>"
+            "<table><tr><th>旧版本 A</th><th>新版本 B</th><th>版本名</th><th>留存时间</th>"
+            "<th>目录行数</th><th>续采位置</th><th></th></tr>"
+            f"{body_rows}</table>"
+            "<p style='margin-top:12px'><button type='submit'>对照所选两个版本</button>"
+            " <span class='muted'>按震例号展示新增、删除及字段更正的旧新值</span></p></form>"
+        )
+    else:
+        table = "<p class='muted'>尚未留存任何目录版本。镜像就绪后，可在上方命名留存当前目录。</p>"
+
+    body = (
+        f"{banner}"
+        f"<div class='card'><h2>留存当前目录</h2>{save_form}</div>"
+        f"<div class='card'><h2>已留存的目录版本（{len(vs)}）</h2>{table}</div>"
+        "<div class='card'><p><a class='btn' href='/'>返回采集状态</a></p></div>"
+    )
+    return page("目录版本对照", body)
+
+
+@app.get("/versions/diff", response_class=HTMLResponse)
+def versions_diff(request: Request):
+    qp = request.query_params
+    try:
+        a_id = int(qp.get("a", ""))
+        b_id = int(qp.get("b", ""))
+    except ValueError:
+        a_id = b_id = None
+    bad = None
+    if a_id is None or b_id is None:
+        bad = "请选择要对照的两个版本。"
+    elif a_id == b_id:
+        bad = "请选择两个不同的版本。"
+    if bad:
+        return HTMLResponse(
+            page("无法对照", f"<div class='card'><p>{esc(bad)}</p>"
+                 "<p><a class='btn' href='/versions'>返回目录版本对照</a></p></div>"),
+            status_code=400,
+        )
+
+    # 两个版本的元信息与全部震例行在同一个只读事务里取出：
+    # 对照期间另有人留存新版本，不会改变本次结果
+    txn = store.read_txn()
+    try:
+        va = txn.execute(
+            "SELECT version_id, name, created_at, source_lsn, row_count"
+            " FROM versions WHERE version_id=? AND status='ready'", (a_id,),
+        ).fetchone()
+        vb = txn.execute(
+            "SELECT version_id, name, created_at, source_lsn, row_count"
+            " FROM versions WHERE version_id=? AND status='ready'", (b_id,),
+        ).fetchone()
+        if not va or not vb:
+            return HTMLResponse(
+                page("版本不存在", "<div class='card'><p>所选版本不存在（可能已被删除）。</p>"
+                     "<p><a class='btn' href='/versions'>返回目录版本对照</a></p></div>"),
+                status_code=404,
+            )
+        rows_a = txn.execute(
+            "SELECT event_id, origin_time, latitude, longitude, magnitude"
+            " FROM version_events WHERE version_id=? ORDER BY event_id", (a_id,),
+        ).fetchall()
+        rows_b = txn.execute(
+            "SELECT event_id, origin_time, latitude, longitude, magnitude"
+            " FROM version_events WHERE version_id=? ORDER BY event_id", (b_id,),
+        ).fetchall()
+    finally:
+        txn.close()
+
+    diff = diff_catalogs(rows_a, rows_b)
+    n_added, n_deleted = len(diff["added"]), len(diff["deleted"])
+    n_changed_events = len(diff["changed"])
+    n_changed_fields = sum(len(d) for _eid, d in diff["changed"])
+
+    def ver_card(tag, v):
+        return (
+            f"<tr><th style='width:14%'>{tag}</th>"
+            f"<td><b>{esc(v[1])}</b> · 留存于 <span class='mono'>{esc(v[2])}</span>"
+            f" · {v[4]} 行 · 续采位置 <span class='mono'>{esc(v[3] or '—')}</span></td></tr>"
+        )
+
+    summary = (
+        f"<table>{ver_card('旧版本 A', va)}{ver_card('新版本 B', vb)}</table>"
+        f"<p style='margin-top:12px'>新增 <b>{n_added}</b> 条 · 删除 <b>{n_deleted}</b> 条 · "
+        f"字段更正 <b>{n_changed_fields}</b> 处（涉及 {n_changed_events} 个震例）</p>"
+        "<p class='muted'>两个版本的内容取自同一个已提交快照；"
+        "对照期间其他人留存新版本不会改变本结果。</p>"
+    )
+    if not (n_added or n_deleted or n_changed_fields):
+        summary += "<div class='ok'>✔ 两个版本内容完全一致</div>"
+
+    def event_rows(rows, limit):
+        return "".join(
+            f"<tr><td class='mono'>{esc(r[0])}</td><td class='mono'>{esc(r[1])}</td>"
+            f"<td>{r[2]:.3f}</td><td>{r[3]:.3f}</td><td>{r[4]:.1f}</td></tr>"
+            for r in rows[:limit]
+        )
+
+    def more_note(total):
+        return (
+            f"<p class='muted'>仅显示前 {DIFF_SHOW_LIMIT} 条，共 {total} 条。</p>"
+            if total > DIFF_SHOW_LIMIT else ""
+        )
+
+    sections = ""
+    if n_added:
+        sections += (
+            f"<div class='card'><h2>新增震例（{n_added}，B 有 A 无）</h2>"
+            "<table><tr><th>震例号</th><th>UTC 发震时刻</th><th>纬度</th><th>经度</th><th>震级</th></tr>"
+            f"{event_rows(diff['added'], DIFF_SHOW_LIMIT)}</table>{more_note(n_added)}</div>"
+        )
+    if n_deleted:
+        sections += (
+            f"<div class='card'><h2>删除震例（{n_deleted}，A 有 B 无）</h2>"
+            "<table><tr><th>震例号</th><th>UTC 发震时刻</th><th>纬度</th><th>经度</th><th>震级</th></tr>"
+            f"{event_rows(diff['deleted'], DIFF_SHOW_LIMIT)}</table>{more_note(n_deleted)}</div>"
+        )
+    if n_changed_fields:
+        change_rows = []
+        for eid, diffs in diff["changed"]:
+            for field, old, new in diffs:
+                change_rows.append(
+                    f"<tr><td class='mono'>{esc(eid)}</td><td>{esc(FIELD_LABELS[field])}</td>"
+                    f"<td>{esc(fmt_field(field, old))}</td><td>{esc(fmt_field(field, new))}</td></tr>"
+                )
+        shown = "".join(change_rows[:DIFF_SHOW_LIMIT])
+        sections += (
+            f"<div class='card'><h2>字段更正（{n_changed_fields} 处，涉及 {n_changed_events} 个震例）</h2>"
+            "<table><tr><th>震例号</th><th>字段</th><th>旧值（A）</th><th>新值（B）</th></tr>"
+            f"{shown}</table>{more_note(n_changed_fields)}</div>"
+        )
+
+    body = (
+        f"<div class='card'><h2>目录版本对照</h2>{summary}</div>"
+        f"{sections}"
+        "<div class='card'><p><a class='btn' href='/versions'>返回目录版本对照</a>"
+        "<a class='btn' href='/'>返回采集状态</a></p></div>"
+    )
+    return page("目录版本对照", body)
 
 
 # ---------------- 路由：一致性校验 ----------------
